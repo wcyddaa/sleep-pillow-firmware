@@ -1,0 +1,59 @@
+# Sleep Pillow - 默认配置
+# 芯片: ESP32-S3
+
+# 分区表
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Flash
+# ★ 板上实际是 16MB Flash（boot log: "SPI Flash Size : 16MB"），
+#   这里必须与硬件一致。写成 4MB 时虽然也能跑（app 分区 0x300000 装得下），
+#   但会浪费 12MB，且与 partitions.csv / 实际芯片对不上。
+#   注：CONFIG_ESPTOOLPY_FLASHSIZE="16MB" 这类字符串由 kconfig 自动派生，
+#       在 defaults 里只写 _16MB=y 就够了。
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# 实际烧录/启动用的是 QIO（boot log: "SPI Mode : QIO"），与 sdkconfig 一致
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# Wi-Fi
+CONFIG_ESP_WIFI_ENABLED=y
+# 注：CONFIG_ESP_WIFI_MODE_STA 在 IDF 5.5 已不存在（每次构建报 unknown kconfig symbol），
+#     已删除。STA 模式由 esp_wifi_set_mode(WIFI_MODE_STA) 在运行时设定。
+
+# 蓝牙（BLE 配网）：只需要 BLE 外设，用轻量的 NimBLE 主机栈
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+# ★ GATT 访问回调（GattAccessCb）跑在这个任务里，栈上要放：
+#   256B 收包缓冲 + cJSON 解析(~2KB) + mbedtls GCM 解密(~1.5KB) + esp_log 的 vsnprintf。
+#   默认 4096 太紧，溢出会 panic 重启 → 手机端表现为"点开关/读配置时蓝牙突然断连"。
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+
+# ★ NimBLE 日志压到 WARNING：BLE 每秒 notify 一次实时数据，
+#   默认 INFO 级别会把每条 "GATT procedure initiated: notify" 都打到串口，
+#   1 秒 2 行刷屏，把应用日志全冲掉。业务层自己打的日志不受影响。
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_LOG_LEVEL=2
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# C++ 运行时
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+CONFIG_COMPILER_CXX_RTTI=y
+
+# 日志
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# 注：原 CONFIG_NVS_COMPRESSION=y 已删除 —— 该 kconfig 符号在 IDF 5.5 不存在，
+#     每次构建都会报 "unknown kconfig symbol" 警告且被忽略。
+
+# PSRAM (N16R8 = 16MB Flash + 8MB Octal PSRAM)
+# Edge model scratch (stage/motion/snore infer) has been moved off task stack
+# into PSRAM via heap_caps_malloc(MALLOC_CAP_SPIRAM). Without these flags the
+# allocation fails and the model tasks still overflow their stacks.
+# Note: real SPI clock on this board is 40M (matches sdkconfig), not 80M.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_USE_MALLOC=y

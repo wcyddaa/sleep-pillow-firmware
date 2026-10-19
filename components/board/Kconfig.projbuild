@@ -1,0 +1,22 @@
+menu "Board Configuration"
+    choice BOARD_TYPE
+        prompt "Select default board type"
+        default BOARD_TYPE_SLEEP_PILLOW_V1
+        help
+            Select the default board type for this build.
+            This determines CONFIG_BOARD_DEFAULT_ID used by BoardRegistry.
+
+    config BOARD_TYPE_SLEEP_PILLOW_V1
+        bool "Sleep Pillow V1"
+    config BOARD_TYPE_SLEEP_PILLOW_V2
+        bool "Sleep Pillow V2"
+    config BOARD_TYPE_ESP_BOX_3
+        bool "ESP-BOX-3"
+    endchoice
+
+    config BOARD_DEFAULT_ID
+        string
+        default "sleep_pillow_v1" if BOARD_TYPE_SLEEP_PILLOW_V1
+        default "sleep_pillow_v2" if BOARD_TYPE_SLEEP_PILLOW_V2
+        default "esp_box_3"       if BOARD_TYPE_ESP_BOX_3
+endmenu

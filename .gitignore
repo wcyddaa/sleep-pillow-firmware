@@ -1,0 +1,31 @@
+# ============================================================
+# sleep-pillow v1.0 (ESP-IDF / ESP32-S3) .gitignore
+# ============================================================
+
+# ---- ESP-IDF 构建产物 ----
+# ⚠️ build/ 里含 sleep_pillow_base.bin —— 已烧入 CLOUD_DEVICE_SECRET 与 BLE 配网 PSK，
+#    这是二进制形态的密钥泄露，绝对不能提交。
+build/
+managed_components/
+dependencies.lock
+sdkconfig.old
+
+# 注：sdkconfig 故意**不忽略** —— 它是本项目实际生效的配置来源；
+#     已确认其中不含 Wi-Fi 凭据。如需改为「只保留 sdkconfig.defaults」，
+#     请先把关键项（分区表 / PSRAM / NimBLE 栈）全部同步进 sdkconfig.defaults 再忽略。
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.orig
+*.rej
+
+# ---- 本地凭据 ----
+# 若后续把密钥从源码拆到独立头文件，这些名字会被自动忽略
+secrets.h
+secret*.h
+*.pem
+*.key
+.env
+.env.*
