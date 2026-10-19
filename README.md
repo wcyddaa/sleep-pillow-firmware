@@ -46,7 +46,7 @@ sleep-pillow/
 │   ├── app_config/              # EdgeMode / AppConfigStore（三开关 NVS 持久化）
 │   ├── board/                   # 板级抽象层：统一硬件接口 + 注册表（工厂模式）
 │   │   ├── include/board.h      #   BoardMicInput / BoardAdcInput 接口定义
-│   │   └── boards/board_sleep_pillow_v1.cc   # ESP32-S3 底板：I2S/ADC 底层封装 + 引脚定义
+│   │   └── boards/board_esp32s3.cc   # ESP32-S3 底板：I2S/ADC 底层封装 + 引脚定义
 │   ├── mic/                     # 双 INMP441 近场选麦合成单声道（业务逻辑，硬件无关）
 │   ├── bcg/                     # 压电 BCG 派生心率/呼吸/体动（业务逻辑，硬件无关）
 │   ├── snore_infer/             # 鼾声推理（特征提取与训练端逐字对齐，内置 |z| 自检）

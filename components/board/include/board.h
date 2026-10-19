@@ -83,6 +83,6 @@ private:
 
 // 强制链接并注册默认板型（由 app_main 调用）
 // 具体板型实现位于静态库 libboard.a 中，若无人引用则不会被链接器
-// 提取，其全局对象 SleepPillowBoard g_board 的静态构造函数也不会执行，
+// 提取，其全局对象 Esp32s3Board g_board 的静态构造函数也不会执行，
 // 导致 Board::GetInstance() 返回空指针。此函数提供一个显式引用入口。
 void BoardEnsureRegistered();

@@ -3,10 +3,11 @@
 #include "driver/i2s_std.h"
 #include "esp_adc/adc_oneshot.h"
 
-static constexpr const char* TAG = "SleepPillowBoard";
+static constexpr const char* TAG = "Esp32s3Board";
 
 // ------------------------------------------------------------
-// SleepPillow v1.0 底板（ESP32-S3 N16R8）
+// ESP32-S3 底板（N16R8：16MB Flash + 8MB PSRAM）
+// 命名约定：boards/ 下每块底板一个 board_xxx.cc，本文件为 board_esp32s3。
 //
 // 本文件是这块底板全部硬件事实的唯一权威定义处：
 //   · 引脚映射 / 总线时序 / ADC 配置全部封装在下面的实现类里，
@@ -37,7 +38,7 @@ static constexpr const char* TAG = "SleepPillowBoard";
 //     （MSB 紧贴 WS 边沿），而 INMP441 的 MSB 在 WS 边沿后延迟 1 BCLK。
 //     差这 1 bit 就会整体错位。
 //   · INMP441 仅支持 3.3V 供电。
-class SleepPillowMicInput : public BoardMicInput {
+class Esp32s3MicInput : public BoardMicInput {
 public:
     esp_err_t Open(int sample_rate) override {
         if (rx_ != nullptr) return ESP_ERR_INVALID_STATE;
@@ -134,7 +135,7 @@ private:
 // 硬件：压电陶瓷 → GPIO1 = ADC1_CHANNEL_0（ESP32-S3 硬件确认）。
 // 偏置电路把信号中点抬到 VCC/2 = 1.65V（≈ 12bit raw 2048），
 // 采集契约：ReadRaw 返回 12bit 原始计数 0~4095，中点 2048 = 偏置电压。
-class SleepPillowAdcInput : public BoardAdcInput {
+class Esp32s3AdcInput : public BoardAdcInput {
 public:
     esp_err_t Open() override {
         if (opened_) return ESP_ERR_INVALID_STATE;
@@ -202,14 +203,14 @@ private:
 // ============================================================
 // 板型定义
 // ============================================================
-class SleepPillowBoard : public Board {
+class Esp32s3Board : public Board {
 public:
-    SleepPillowBoard() {
+    Esp32s3Board() {
         Board::SetInstance(this);
     }
 
     bool Init() override {
-        ESP_LOGI(TAG, "Initializing SleepPillow board...");
+        ESP_LOGI(TAG, "Initializing ESP32-S3 board...");
         // 底层外设（I2S 麦克风 / ADC）不在此初始化：上层组件按需经
         // GetMicInput()/GetBcgAdc() 索取，由组件在 REAL 模式下 Open。
         return true;
@@ -224,12 +225,12 @@ public:
     BoardAdcInput* GetBcgAdc()   override { return &bcg_adc_; }
 
 private:
-    SleepPillowMicInput mic_input_;
-    SleepPillowAdcInput bcg_adc_;
+    Esp32s3MicInput mic_input_;
+    Esp32s3AdcInput bcg_adc_;
 };
 
 // 全局单例实例（静态构造时自动注册到Board::GetInstance()）
-static SleepPillowBoard g_board;
+static Esp32s3Board g_board;
 
 // 强制链接入口：被 app_main 引用后，本目标文件才会从 libboard.a 中
 // 被提取出来，g_board 才会存在；同时显式注册一次，避免依赖静态

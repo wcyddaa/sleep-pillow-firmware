@@ -2,7 +2,7 @@
 // ============================================================
 // 硬件：两个 INMP441 并联在同一组 I2S 总线上，只有 L/R 引脚不同。
 //   总线引脚、32bit 槽宽、INMP441 对齐修正等底层细节由板级抽象层
-//   封装（components/board/boards/board_sleep_pillow_v1.cc），
+//   封装（components/board/boards/board_esp32s3.cc），
 //   本组件只经 BoardMicInput 统一接口取交错立体声数据。
 //
 // 输出：单声道 16kHz PCM（与 snore_infer 的输入契约一致）
