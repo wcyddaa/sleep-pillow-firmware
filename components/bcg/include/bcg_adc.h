@@ -1,7 +1,7 @@
 // bcg_adc.h - 压电陶瓷(BCG) 采集与三通道派生
 // ============================================================
 // 数据源：
-//   REAL: ESP32-S3 ADC1_CH0 @ GPIO1，140Hz 采样压电陶瓷
+//   REAL: 板型 ADC 输入（GPIO/通道由板型定义），140Hz 采样压电陶瓷
 //         偏置电路 VCC/2=1.65V，ADC raw→减中点 2048→归一化 ±1
 //         ADC 失败绝不回退 SIM，任务等待重试
 //   SIM : 固件内置合成 140Hz 信号（心跳 60bpm + 呼吸 15bpm + 体动 0.2Hz）
@@ -14,17 +14,17 @@
 
 #include <stdint.h>
 #include "esp_err.h"
-#include "esp_adc/adc_oneshot.h"   // ★ adc_oneshot_unit_handle_t 等类型定义在这里，
-                                   //   头文件里声明成员变量必须先包含它
 #include "motion_infer.h"
 #include "app_config.h"
 
+// 板级抽象层统一硬件接口（板型提供实现，本组件只面向接口）
+class BoardAdcInput;
+
 namespace sleep_pillow {
 
-// ADC 引脚与采样率
-//   GPIO1 → ADC1_CHANNEL_0（ESP32-S3 硬件确认）
-//   压电陶瓷经放大电路偏置到 1.65V（VCC/2），ADC 读 raw 后减中点归一化到 ±1。
-inline constexpr int kBcgAdcGpioDefault = 1;     // GPIO1 = ADC1_CHANNEL_0
+// 采样率（业务契约，140Hz）。ADC 的 GPIO/通道/量程配置属于板级抽象层，
+// 由板型 BoardAdcInput 封装；原始计数中点 = 板型偏置电压（1.65V → 12bit 2048），
+// 本组件读 raw 后减中点归一化到 ±1。
 inline constexpr int kBcgSampleRateHz   = 140;
 
 // 派生输出（每 60s 滚动一次）
@@ -54,8 +54,8 @@ class BcgAdc {
 public:
     static BcgAdc* GetInstance();
 
-    // 初始化；按 mode 决定 REAL/SIM
-    esp_err_t Init(EdgeMode mode, int gpio_num = kBcgAdcGpioDefault);
+    // 初始化；按 mode 决定 REAL/SIM（REAL 时向板型索取 ADC 输入）
+    esp_err_t Init(EdgeMode mode);
 
     // 每次读一个 140Hz 样本（REAL 走 ADC，SIM 走合成）
     // 返回 false = 当前模式不工作
@@ -83,17 +83,10 @@ private:
     ~BcgAdc();
 
     EdgeMode mode_ = EdgeMode::kOff;
-    int      gpio_ = kBcgAdcGpioDefault;
     bool     adc_inited_ = false;
 
-    // ADC1 OneShot 驱动句柄（由 InitAdc() 创建，DoneAdc() 销毁）
-    adc_oneshot_unit_handle_t adc_handle_ = nullptr;
-    adc_oneshot_unit_init_cfg_t init_cfg_{};
-    adc_oneshot_chan_cfg_t chan_cfg_{};
-    adc_channel_t chan_ = ADC_CHANNEL_0;   // 由 gpio_ 自动映射（InitAdc 里算）
-
-    esp_err_t InitAdc();   // 创建 ADC handle 并校准
-    void      DoneAdc();   // 销毁 ADC handle
+    // 板型提供的 ADC 输入实现（底层封装：单元/通道/量程/引脚）
+    BoardAdcInput* adc_ = nullptr;
 
     // 合成信号相位
     uint64_t sim_phase_ = 0;

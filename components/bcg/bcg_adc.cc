@@ -3,8 +3,7 @@
 #include "motion_infer.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_adc/adc_oneshot.h"
-#include "driver/gpio.h"
+#include "board.h"                 // 向板型索取 BoardAdcInput（底层封装）
 #include "freertos/FreeRTOS.h"     // DetectSensor() 里用 vTaskDelay 让出 CPU
 #include "freertos/task.h"
 #include <cmath>
@@ -15,14 +14,6 @@
 #endif
 
 namespace sleep_pillow {
-
-// ESP32-S3 ADC1 的 GPIO→通道映射（GPIO1..GPIO10 = CH0..CH9）
-static adc_channel_t AdcChannelOf(int gpio) {
-    if (gpio >= 1 && gpio <= 10) {
-        return (adc_channel_t)(gpio - 1);
-    }
-    return ADC_CHANNEL_0;   // 非法值回落到默认
-}
 
 BcgAdc* BcgAdc::GetInstance() {
     static BcgAdc inst;
@@ -45,25 +36,33 @@ void BcgAdc::AllocateRingIfNeeded() {
     }
 }
 
-esp_err_t BcgAdc::Init(EdgeMode mode, int gpio_num) {
+esp_err_t BcgAdc::Init(EdgeMode mode) {
     mode_ = mode;
-    gpio_ = gpio_num;
     AllocateRingIfNeeded();
 
     if (mode_ == EdgeMode::kReal) {
-        esp_err_t err = InitAdc();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "REAL 模式：ADC 初始化失败=%s，BCG 任务不启动",
-                     esp_err_to_name(err));
+        // 向板型索取 ADC 输入实现（单元/通道/量程/引脚全在板级抽象层封装）
+        auto* board = Board::GetInstance();
+        if (board == nullptr) {
+            ESP_LOGE(TAG, "Board 未注册，无法获取 ADC 输入接口");
             adc_inited_ = false;
-            // ★★★ REAL 模式绝不回退到 SIM：麦克风/压电陶瓷故障不偷偷换合成数据
         } else {
-            adc_inited_ = true;
-            ESP_LOGI(TAG, "REAL 模式：压电陶瓷 GPIO%02d → ADC1_CH%d，140Hz 采集就绪",
-                     gpio_, (int)chan_);
-            // ★ 立刻做一次接入检测，把「硬件到底接没接」一次说清楚
-            const BcgHealth h = DetectSensor();
-            ESP_LOGW(TAG, "压电陶瓷接入检测: %s", BcgHealthText(h));
+            adc_ = board->GetBcgAdc();
+            esp_err_t err = (adc_ == nullptr) ? ESP_ERR_NOT_SUPPORTED : adc_->Open();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "REAL 模式：ADC 打开失败=%s（板型 %s），BCG 任务不启动",
+                         esp_err_to_name(err),
+                         (adc_ == nullptr) ? "未提供 ADC 接口" : board->GetBoardName());
+                adc_ = nullptr;
+                adc_inited_ = false;
+                // ★★★ REAL 模式绝不回退到 SIM：麦克风/压电陶瓷故障不偷偷换合成数据
+            } else {
+                adc_inited_ = true;
+                ESP_LOGI(TAG, "REAL 模式：压电陶瓷采集就绪，140Hz（通道/量程见板型日志）");
+                // ★ 立刻做一次接入检测，把「硬件到底接没接」一次说清楚
+                const BcgHealth h = DetectSensor();
+                ESP_LOGW(TAG, "压电陶瓷接入检测: %s", BcgHealthText(h));
+            }
         }
     } else if (mode_ == EdgeMode::kSim) {
         ESP_LOGI(TAG, "SIM 模式：合成 140Hz BCG 信号（心率 60 / 呼吸 15 / 体动 0.2Hz）");
@@ -99,7 +98,7 @@ const char* BcgHealthText(BcgHealth h) {
 BcgHealth BcgAdc::DetectSensor() {
     if (mode_ == EdgeMode::kSim) return BcgHealth::kOk;   // 模拟模式不做硬件检测
     if (mode_ == EdgeMode::kOff) return BcgHealth::kAdcFail;
-    if (!adc_inited_ || !adc_handle_) return BcgHealth::kAdcFail;
+    if (!adc_inited_ || !adc_) return BcgHealth::kAdcFail;
 
     const int n = kBcgSampleRateHz / 2;   // 0.5s
     int mn = 4095, mx = 0;
@@ -107,7 +106,7 @@ BcgHealth BcgAdc::DetectSensor() {
     int ok_cnt = 0;
     for (int i = 0; i < n; ++i) {
         int raw = 0;
-        if (adc_oneshot_read(adc_handle_, chan_, &raw) == ESP_OK) {
+        if (adc_->ReadRaw(&raw) == ESP_OK) {
             if (raw < mn) mn = raw;
             if (raw > mx) mx = raw;
             sum += raw;
@@ -139,57 +138,9 @@ BcgHealth BcgAdc::DetectSensor() {
 }
 
 BcgAdc::~BcgAdc() {
-    DoneAdc();
-}
-
-esp_err_t BcgAdc::InitAdc() {
-    // -------------------------------------------------
-    // ADC1 通道随 GPIO 自动映射（ESP32-S3：GPIO1→CH0, GPIO2→CH1, GPIO3→CH2 …）
-    // 默认 GPIO1 = ADC1_CHANNEL_0
-    // -------------------------------------------------
-    chan_ = AdcChannelOf(gpio_);
-
-    // 1) 单元初始化
-    //    显式写全所有字段：只写 unit_id 时编译器会报
-    //    -Wmissing-field-initializers（clk_src / ulp_mode 未初始化）
-    init_cfg_ = {
-        .unit_id  = ADC_UNIT_1,
-        .clk_src  = ADC_RTC_CLK_SRC_DEFAULT,
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-    esp_err_t err = adc_oneshot_new_unit(&init_cfg_, &adc_handle_);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "adc_oneshot_new_unit failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    // 2) 通道配置
-    //    attenuation=12dB（原 11dB 已废弃，两者行为一致）→ 量程≈0~3.1V，
-    //    覆盖压电陶瓷经 1.65V 偏置后的输出
-    //    bit_width=12 → raw ∈ [0, 4095]，中点 2048 对应 1.65V
-    chan_cfg_ = {
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    err = adc_oneshot_config_channel(adc_handle_, chan_, &chan_cfg_);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "adc_oneshot_config_channel failed: %s", esp_err_to_name(err));
-        adc_oneshot_del_unit(adc_handle_);
-        adc_handle_ = nullptr;
-        return err;
-    }
-
-    // 3) 校准（可选，提升精度；校准失败不影响采集，只是精度略低）
-    //    ESP32-S3 提供 eFuse 校准值，adc_cali_efuse_calibration() 会自动读取。
-    ESP_LOGI(TAG, "ADC1_CH%d 初始化完成（atten=12dB, 12bit, GPIO%02d）",
-             (int)chan_, gpio_);
-    return ESP_OK;
-}
-
-void BcgAdc::DoneAdc() {
-    if (adc_handle_) {
-        adc_oneshot_del_unit(adc_handle_);
-        adc_handle_ = nullptr;
+    if (adc_ != nullptr) {
+        adc_->Close();
+        adc_ = nullptr;
     }
 }
 
@@ -213,21 +164,21 @@ bool BcgAdc::ReadSample(float* out) {
         return true;
     }
 
-    // REAL：走真实 ADC（InitAdc() 已成功创建 adc_handle_）
+    // REAL：走真实 ADC（板型 BoardAdcInput 已 Open 成功）
     if (mode_ == EdgeMode::kReal) {
-        if (!adc_inited_ || !adc_handle_) {
+        if (!adc_inited_ || !adc_) {
             // ★ REAL 模式绝不回退 SIM。这里每 5 秒才提示一次：
             //   本函数被 140Hz 调用，逐次打印会直接刷爆串口。
             if ((read_err_cnt_++ % (kBcgSampleRateHz * 5)) == 0) {
-                ESP_LOGE(TAG, "REAL 模式但 ADC 未就绪（检查 GPIO%d 接线与 Init 日志）", gpio_);
+                ESP_LOGE(TAG, "REAL 模式但 ADC 未就绪（检查压电陶瓷接线与 Init 日志）");
             }
             return false;
         }
         int raw;
-        esp_err_t err = adc_oneshot_read(adc_handle_, chan_, &raw);
+        esp_err_t err = adc_->ReadRaw(&raw);
         if (err != ESP_OK) {
             if ((read_err_cnt_++ % (kBcgSampleRateHz * 5)) == 0) {
-                ESP_LOGE(TAG, "adc_oneshot_read failed: %s", esp_err_to_name(err));
+                ESP_LOGE(TAG, "ADC ReadRaw failed: %s", esp_err_to_name(err));
             }
             return false;
         }
@@ -452,7 +403,7 @@ void BcgAdc::UpdateMotion() {
 
 float BcgAdc::SelfTest() {
     if (mode_ == EdgeMode::kOff) return -1.0f;
-    Init(mode_, gpio_);
+    Init(mode_);
     sim_phase_ = 0;
     for (int i = 0; i < kDeriveWinSamples; ++i) {
         float s;

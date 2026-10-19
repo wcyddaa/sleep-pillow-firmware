@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "board.h"
 
 namespace sleep_pillow {
 
@@ -19,8 +20,6 @@ esp_err_t Inmp441Mic::Init(const Inmp441MicConfig& cfg) {
     cfg_ = cfg;
     if (cfg_.sample_rate <= 0)       cfg_.sample_rate = 16000;
     if (cfg_.max_mono_samples <= 0)  cfg_.max_mono_samples = 16000;
-    if (cfg_.dma_buf_count <= 0)     cfg_.dma_buf_count = 6;
-    if (cfg_.dma_buf_len <= 0)       cfg_.dma_buf_len = 256;
 
     // ---- 交错立体声 scratch（PSRAM 优先，回退内部 SRAM）----
     // ★ 用 int32_t：INMP441 是 24bit 器件，32bit 槽才能装下完整数据。
@@ -38,63 +37,26 @@ esp_err_t Inmp441Mic::Init(const Inmp441MicConfig& cfg) {
         return ESP_ERR_NO_MEM;
     }
 
-    // ---- 建 I2S RX 通道（master，仅接收）----
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num  = (uint32_t)cfg_.dma_buf_count;
-    chan_cfg.dma_frame_num = (uint32_t)cfg_.dma_buf_len;
-
-    esp_err_t err = i2s_new_channel(&chan_cfg, nullptr, &rx_);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_new_channel 失败: %s", esp_err_to_name(err));
-        rx_ = nullptr;
+    // ---- 向板型索取 I2S 采集实现并打开 ----
+    // 通道建立、DMA、引脚、槽宽与对齐修正全部封装在板级抽象层，
+    // 本组件只面对 BoardMicInput 统一接口。
+    auto* board = Board::GetInstance();
+    if (board == nullptr) {
+        ESP_LOGE(TAG, "Board 未注册，无法获取麦克风采集接口");
         heap_caps_free(stereo_scratch_);
         stereo_scratch_ = nullptr;
-        return err;
+        return ESP_ERR_INVALID_STATE;
     }
-
-    // 沿用 ESP-IDF 官方示例的聚合初始化写法（字段顺序与声明一致）
-    // ★ 32bit 槽宽：INMP441 每个 WS 半周期发 1bit 延迟 + 24bit 数据 = 25bit，
-    //   16bit 槽装不下，会造成声道混叠 + 位错位（表现为采样值乱跳、长期满幅）。
-    i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)cfg_.sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-            I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,                      // INMP441 不需要 MCLK
-            .bclk = (gpio_num_t)cfg_.bclk_pin,
-            .ws   = (gpio_num_t)cfg_.ws_pin,
-            .dout = I2S_GPIO_UNUSED,                      // 只收不发
-            .din  = (gpio_num_t)cfg_.din_pin,
-            .invert_flags = {
-                .mclk_inv = 0,
-                .bclk_inv = 0,
-                .ws_inv   = 0,
-            },
-        },
-    };
-
-    // ★ 覆盖 slot 对齐方式：ESP32-S3 的 Philips 宏默认 left_align=true（MSB 零延迟），
-    //   而 INMP441 的 MSB 在 WS 边沿后延迟 1 BCLK。差这 1 bit 就会整体错位。
-    std_cfg.slot_cfg.left_align = cfg_.i2s_left_align;
-    ESP_LOGW(TAG, "I2S slot: 32bit 槽, bit_shift=%d left_align=%d ws_width=%d data_bit_width=%d",
-             (int)std_cfg.slot_cfg.bit_shift, (int)std_cfg.slot_cfg.left_align,
-             (int)std_cfg.slot_cfg.ws_width, (int)std_cfg.slot_cfg.data_bit_width);
-
-    err = i2s_channel_init_std_mode(rx_, &std_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_channel_init_std_mode 失败: %s", esp_err_to_name(err));
-        i2s_del_channel(rx_);
-        rx_ = nullptr;
+    input_ = board->GetMicInput();
+    if (input_ == nullptr) {
+        ESP_LOGE(TAG, "板型 %s 未提供麦克风采集接口", board->GetBoardName());
         heap_caps_free(stereo_scratch_);
         stereo_scratch_ = nullptr;
-        return err;
+        return ESP_ERR_NOT_SUPPORTED;
     }
-
-    err = i2s_channel_enable(rx_);
+    esp_err_t err = input_->Open(cfg_.sample_rate);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_channel_enable 失败: %s", esp_err_to_name(err));
-        i2s_del_channel(rx_);
-        rx_ = nullptr;
+        input_ = nullptr;
         heap_caps_free(stereo_scratch_);
         stereo_scratch_ = nullptr;
         return err;
@@ -103,17 +65,15 @@ esp_err_t Inmp441Mic::Init(const Inmp441MicConfig& cfg) {
     ready_ = true;
     cur_pick_ = 0;
     short_frames_ = 0;
-    ESP_LOGI(TAG, "初始化完成: %dHz/16bit/立体声, BCLK=%d WS=%d DIN=%d, scratch=%uB",
-             cfg_.sample_rate, cfg_.bclk_pin, cfg_.ws_pin, cfg_.din_pin,
-             (unsigned)scratch_bytes);
+    ESP_LOGI(TAG, "初始化完成: %dHz 单声道契约, scratch=%uB（引脚/时序见板型日志）",
+             cfg_.sample_rate, (unsigned)scratch_bytes);
     return ESP_OK;
 }
 
 esp_err_t Inmp441Mic::Deinit() {
-    if (rx_ != nullptr) {
-        i2s_channel_disable(rx_);
-        i2s_del_channel(rx_);
-        rx_ = nullptr;
+    if (input_ != nullptr) {
+        input_->Close();
+        input_ = nullptr;
     }
     if (stereo_scratch_ != nullptr) {
         heap_caps_free(stereo_scratch_);
@@ -296,13 +256,13 @@ size_t Inmp441Mic::ReadMono(int16_t* dst, size_t mono_samples, uint32_t timeout_
     }
 
     // 产出 N 个单声道样本 == 读 N 个立体声帧（每帧 L+R 两个 int32）
-    const size_t want_bytes = mono_samples * 2 * sizeof(int32_t);
     size_t got_bytes = 0;
-    const esp_err_t err = i2s_channel_read(rx_, stereo_scratch_, want_bytes,
-                                           &got_bytes, timeout_ms);
+    const esp_err_t err = input_->ReadStereo(stereo_scratch_, mono_samples,
+                                             &got_bytes, timeout_ms);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "i2s_channel_read: %s (%u/%u B)",
-                 esp_err_to_name(err), (unsigned)got_bytes, (unsigned)want_bytes);
+        ESP_LOGW(TAG, "ReadStereo: %s (%u/%u B)",
+                 esp_err_to_name(err), (unsigned)got_bytes,
+                 (unsigned)(mono_samples * 2 * sizeof(int32_t)));
     }
 
     const size_t got_frames = got_bytes / (2 * sizeof(int32_t));

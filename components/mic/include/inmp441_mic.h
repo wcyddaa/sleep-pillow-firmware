@@ -1,9 +1,9 @@
 // inmp441_mic.h - 双 INMP441 立体声 I2S 采集 → 单声道近场输出
 // ============================================================
-// 硬件（两个 INMP441 并联在同一组 I2S 总线上，只有 L/R 引脚不同）：
-//   麦1（左声道）: VDD/GND/SCK/WS/SD 与总线并联, L/R -> GND
-//   麦2（右声道）: VDD/GND/SCK/WS/SD 与总线并联, L/R -> 3V3
-//   总线: SCK(BCLK)=GPIO5, WS(LRCLK)=GPIO4, SD(DIN)=GPIO6
+// 硬件：两个 INMP441 并联在同一组 I2S 总线上，只有 L/R 引脚不同。
+//   总线引脚、32bit 槽宽、INMP441 对齐修正等底层细节由板级抽象层
+//   封装（components/board/boards/board_sleep_pillow_v1.cc），
+//   本组件只经 BoardMicInput 统一接口取交错立体声数据。
 //
 // 输出：单声道 16kHz PCM（与 snore_infer 的输入契约一致）
 //
@@ -22,19 +22,17 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "esp_err.h"
-#include "driver/i2s_std.h"
+
+// 板级抽象层统一硬件接口（板型提供实现，本组件只面向接口）
+class BoardMicInput;
 
 namespace sleep_pillow {
 
 // 采集参数。注：**定义在命名空间层**，不能放进 Inmp441Mic 内部 ——
 // 否则 Init() 的默认参数 `Config{}` 会因类尚未完整而编译失败。
+// 只保留业务侧参数；总线/引脚/时序属于板级抽象层，不在此出现。
 struct Inmp441MicConfig {
-    int bclk_pin    = 5;      // INMP441 SCK
-    int ws_pin      = 4;      // INMP441 WS / LRCLK
-    int din_pin     = 6;      // INMP441 SD（两麦并联）
     int sample_rate = 16000;  // 与 snore_infer / kSnoreSampleRate 一致
-    int dma_buf_count = 6;    // DMA 描述符/缓冲块数
-    int dma_buf_len   = 256;  // 每块立体声帧数
     // 预留的最大单声道帧数（决定 PSRAM scratch 大小）。1 秒 @16k = 16000
     int max_mono_samples = 16000;
 
@@ -45,20 +43,6 @@ struct Inmp441MicConfig {
     // 注：模型只会对「训练时的输入分布」可靠。除非确有需要，
     //     保持 false，把偏差变量降到最少。
     bool near_field_select = false;
-
-    // ★★ I2S 数据对齐方式（排查「长期满幅 + dc 乱跳」的关键开关）
-    //
-    //   ESP32-S3 的 I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG 里 left_align = true，
-    //   含义是「MSB 紧贴 WS 边沿、零延迟」。
-    //   而 INMP441 遵循标准 Philips I2S：**MSB 在 WS 边沿后延迟 1 个 BCLK**。
-    //   两者相差 1 bit → 整个样本被错误解释（数值错位 + 符号位错）
-    //   → 表现为 rms 长期 50%、pk 频繁顶满 32768、帧均值(dc)大幅乱跳。
-    //
-    //   true  = 库默认（left_align=true）
-    //   false = 右对齐（数据延迟 1 BCLK，匹配 INMP441）
-    //
-    //   症状对不上时两个值都试，看哪个 rms 正常（安静环境应在 1~5%）。
-    bool i2s_left_align = false;
 };
 
 // 麦克风自检结论
@@ -75,7 +59,7 @@ class Inmp441Mic {
 public:
     static Inmp441Mic* GetInstance();
 
-    // 初始化 I2S（幂等）。失败返回错误码，可重试。
+    // 经板型 BoardMicInput 打开采集（幂等）。失败返回错误码，可重试。
     esp_err_t Init(const Inmp441MicConfig& cfg = Inmp441MicConfig{});
     esp_err_t Deinit();
     bool IsReady() const { return ready_; }
@@ -125,7 +109,7 @@ private:
     //     16bit 槽装不下 1BCLK 延迟 + 24bit 数据，会声道混叠+位错位）
     void MixToMono(const int32_t* stereo, size_t frames, int16_t* mono);
 
-    i2s_chan_handle_t       rx_ = nullptr;
+    BoardMicInput*          input_ = nullptr;  // 板型提供的 I2S 采集实现（底层封装）
     Inmp441MicConfig        cfg_{};
     bool                    ready_ = false;
 

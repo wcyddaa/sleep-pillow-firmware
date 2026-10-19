@@ -1,10 +1,10 @@
-﻿idf_component_register(
+idf_component_register(
     SRCS "bcg_adc.cc"
     INCLUDE_DIRS "include"
-    # ★ esp_adc 必须是公共依赖(REQUIRES)：bcg_adc.h 里声明了
-    #   adc_oneshot_unit_handle_t 等成员变量，属于公开接口的一部分。
-    #   放在 PRIV_REQUIRES 里时，main 等使用方 include bcg_adc.h 会找不到
-    #   esp_adc/adc_oneshot.h → 编译失败。
-    REQUIRES app_config motion_infer esp_adc
-    PRIV_REQUIRES driver
+    # app_config/motion_infer 是公共依赖(REQUIRES)：bcg_adc.h 里
+    # 使用了 EdgeMode 等类型，属于公开接口的一部分。
+    # 底层 ADC 操作与引脚封装在板级抽象层，本组件只面向 BoardAdcInput
+    # 接口 → board.h 仅在 .cc 中引用，放 PRIV_REQUIRES。
+    REQUIRES app_config motion_infer
+    PRIV_REQUIRES board
 )

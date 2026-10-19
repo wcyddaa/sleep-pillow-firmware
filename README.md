@@ -10,6 +10,7 @@ ESP32-S3 端侧智能睡眠枕固件：在 MCU 上直接运行三个 int8 神经
 
 ## 功能特性
 
+- **板级抽象层**：本项目支持多硬件底板，采用板级抽象层隔离硬件差异。上层业务组件使用统一硬件接口（`BoardMicInput` / `BoardAdcInput`），不直接绑定硬件引脚，也不包含 IDF 底层驱动头文件；I2S/ADC 等硬件相关底层操作全部由板级抽象层封装。新增底板 = 在 `boards/` 下新增一个板型实现，上层组件零改动。当前版本仅完成 ESP32-S3 底板的适配。
 - **端侧三模型推理**（自研 int8 前向引擎，不依赖 TFLite Micro）：
   - 鼾声识别：1s/16kHz 音频 → 64 维手工特征 → int8 MLP（64→48→24→2）
   - 睡眠分期：BCG 派生特征，每 30s 推理一次
@@ -43,9 +44,11 @@ sleep-pillow/
 │       └── app_main.h
 ├── components/
 │   ├── app_config/              # EdgeMode / AppConfigStore（三开关 NVS 持久化）
-│   ├── board/                   # 板级抽象 + 注册表（工厂模式），板型 board_sleep_pillow_v1
-│   ├── mic/                     # 双 INMP441 I2S 采集 + 近场选麦合成单声道
-│   ├── bcg/                     # 压电 BCG ADC，派生心率/呼吸/体动
+│   ├── board/                   # 板级抽象层：统一硬件接口 + 注册表（工厂模式）
+│   │   ├── include/board.h      #   BoardMicInput / BoardAdcInput 接口定义
+│   │   └── boards/board_sleep_pillow_v1.cc   # ESP32-S3 底板：I2S/ADC 底层封装 + 引脚定义
+│   ├── mic/                     # 双 INMP441 近场选麦合成单声道（业务逻辑，硬件无关）
+│   ├── bcg/                     # 压电 BCG 派生心率/呼吸/体动（业务逻辑，硬件无关）
 │   ├── snore_infer/             # 鼾声推理（特征提取与训练端逐字对齐，内置 |z| 自检）
 │   ├── stage_infer/             # 睡眠分期推理 + StageFeatureBuilder
 │   ├── motion_infer/            # 体动推理
