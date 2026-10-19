@@ -22,6 +22,16 @@
 
 namespace sleep_pillow {
 
+// 鼾声事件（端侧事实）：连续 prob≥0.5 且 ≥kMinEventSec 秒记为一次事件，
+// 间隔 <kMergeGapSec 秒的命中合并进同一事件。事件结束后挂到
+// 「结束所在窗口」的帧里，JSON 追加 "snore_events":[{"s":..,"e":..},..]。
+// s/e = 事件首/末命中秒的 epoch 时间戳（含端点）—— 后端「打鼾次数/平均间隔」
+// 直接由此统计，不再从秒数反推。
+struct SnoreEventSpan {
+    uint32_t s;
+    uint32_t e;
+};
+
 struct SleepFrame {
     uint32_t window_start_ts;   // 窗口开始时间戳(秒)
     uint32_t window_end_ts;     // 窗口结束时间戳
@@ -31,7 +41,7 @@ struct SleepFrame {
     int8_t   motion;            // -1=关闭, 0=静, 1=体动
     int8_t   snore_seconds;     // -1=关闭, 0-30
     uint8_t  flags;             // bit0=snore_off, bit1=stage_off, bit2=bcg_off
-    char     json[288];         // 含 device_id + cfg 子对象
+    char     json[512];         // 含 device_id + cfg 子对象 + snore_events[]
     size_t   json_len;
 };
 
@@ -94,9 +104,29 @@ private:
     // 让这期间打开的其它开关并入同一个窗口；0 表示不在宽限期。
     time_t        grace_until_ts_ = 0;
 
+    // ---- 鼾声事件状态机（OnSnoreProb 由 snore 任务调用，
+    //      PublishCurrentFrame 由 edge_agg 任务调用 → 用自旋锁保护共享状态）----
+    // 结束当前事件：命中 ≥kMinEventSec 才算完整事件，入 pending 并拷给 out_ev
+    //（供调用方出锁后打日志）。**临界区内只做状态操作，不许打日志。**
+    // @return 是否产生了完整事件
+    bool CloseSnoreEventLocked(SnoreEventSpan* out_ev);
+    int              evt_open_     = 0;      // 是否处于鼾声事件中
+    time_t           evt_start_    = 0;      // 事件首命中秒
+    time_t           evt_last_hit_ = 0;      // 事件末命中秒（合并判定基准）
+    int              evt_secs_     = 0;      // 事件内命中秒数
+    SnoreEventSpan   evt_pending_[8] = {}; // 已结束、待随下一帧上行的事件
+    size_t           evt_pending_cnt_ = 0;
+    portMUX_TYPE     snore_evt_lock_ = portMUX_INITIALIZER_UNLOCKED;
+
     static constexpr const char* TAG = "EdgeAggregator";
     static constexpr int kWindowSec = 30;
     static constexpr int kGraceSec  = 5;
+    // 事件判定：连续命中 ≥3 秒才算一次「打鼾事件」；与上一次命中间隔 <4 秒
+    // 视为同一事件延续（偶发单秒噪声不算事件，短停顿不拆成两次）
+    static constexpr int kMinEventSec  = 3;
+    static constexpr int kMergeGapSec  = 4;
+    // 须与上方 evt_pending_ 的字面量 8 一致（数组边界在常量声明前，只能写字面量）
+    static constexpr size_t kMaxPendingEvents = 8;
 };
 
 }  // namespace sleep_pillow

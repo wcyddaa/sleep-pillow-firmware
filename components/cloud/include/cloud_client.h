@@ -11,7 +11,9 @@
 // 否则平台直接丢弃 —— 本项目历史上 cfg 走 /device/{id}/cfg 时就是这么一直没通。
 //
 // 注：三开关（snore/stage/bcg）是**设备本地状态**，走 BLE 0x04/0x05 读写，
-//     不经云端；当前 cfg 会作为字段随每一帧上行，后端无需单独存。
+//     本地权威性不变；BLE 切开关时会补发一次 evt:"cfg" 快照上行，
+//     后端落 device_cfg 表做「云端可查」镜像。快照不进离线队列、断网即放弃
+//     （过期 cfg 不应覆盖新状态），每帧携带的 cfg 字段在后端兜底刷新。
 //
 // 鉴权（华为云密钥鉴权，一机一密）：
 //   clientId = {device_id}_0_{sign_type}_{UTC时间戳 YYYYMMDDHH}
@@ -61,6 +63,12 @@ public:
     // ★ 30s 一帧结构化数据上行：主题 /device/{id}/frame
     //   输入已经是 JSON 字符串（由 EdgeAggregator 组装，含 device_id 字段）
     bool PublishFrame(const char* json);
+
+    // ★ cfg 快照上行（BLE 切开关时 AppMain 调用一次）：
+    //   payload 形如 {"device_id":"..","evt":"cfg","cfg":{...},"ts":..}
+    //   与 PublishFrame 同主题，后端按 evt 分流落 device_cfg 快照。
+    //   未连接直接返回 false，不进离线队列（过期 cfg 不应补传覆盖新状态）。
+    bool PublishCfg(const char* json);
 
     // 上行主题查询（供测试/调试用）
     // 两类消息共用标准系统主题 $oc/devices/{id}/sys/messages/up，

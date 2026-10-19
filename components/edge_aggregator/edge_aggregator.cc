@@ -6,6 +6,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "offline_queue.h"  // 上行失败 → 落盘离线队列，重连后补传
 #include <inttypes.h>
 #include <time.h>
 #include <cstdio>
@@ -30,13 +31,58 @@ void EdgeAggregator::SetSources(SnoreInfer* snore, StageInfer* stage, BcgAdc* bc
     bcg_   = bcg;
 }
 
+// 结束当前鼾声事件：命中秒数 ≥kMinEventSec 才算一次事件入 pending，
+// 否则视为偶发噪声丢弃。须持 snore_evt_lock_ 调用；**临界区内不打日志**。
+bool EdgeAggregator::CloseSnoreEventLocked(SnoreEventSpan* out_ev) {
+    if (out_ev) { out_ev->s = 0; out_ev->e = 0; }
+    if (!evt_open_) return false;
+    evt_open_ = 0;
+    if (evt_secs_ < kMinEventSec) return false;   // 太短：偶发单秒噪声，不算事件
+
+    if (evt_pending_cnt_ >= kMaxPendingEvents) {
+        // 异常场景兜底（正常一窗口最多 ~4 次事件）：丢最老保最新
+        memmove(evt_pending_, evt_pending_ + 1,
+                (kMaxPendingEvents - 1) * sizeof(SnoreEventSpan));
+        evt_pending_cnt_ = kMaxPendingEvents - 1;
+    }
+    const SnoreEventSpan ev{(uint32_t)evt_start_, (uint32_t)evt_last_hit_};
+    evt_pending_[evt_pending_cnt_++] = ev;
+    if (out_ev) *out_ev = ev;
+    return true;
+}
+
 void EdgeAggregator::OnSnoreProb(float prob) {
     // 每秒调用一次：既累计窗口秒数，也记下"这一秒是否在打鼾"供实时区用
     // 注：只有**真正拿到有效音频**才会调到这里，所以顺便统计有效秒数，
     //     用于区分"没鼾声"和"没数据"。
+    const time_t now = time(nullptr);
+    const int hit = (prob >= 0.5f) ? 1 : 0;
+
     ++snore_valid_cnt_;
-    last_snore_hit_ = (prob >= 0.5f) ? 1 : 0;
-    snore_sec_cnt_ += last_snore_hit_;
+    last_snore_hit_ = hit;
+    snore_sec_cnt_ += hit;
+
+    // ★ 鼾声事件状态机（端侧事实，后端"次数/平均间隔"直接由此统计）：
+    //   命中 → 开启/延续事件；距上次命中 ≥kMergeGapSec → 事件结束。
+    //   事件跨窗口是常态：结束前不进 pending，结束所在窗口随帧上行。
+    if (hit) {
+        if (!evt_open_) {
+            evt_open_  = 1;
+            evt_start_ = now;
+            evt_secs_  = 0;
+        }
+        ++evt_secs_;
+        evt_last_hit_ = now;
+    } else if (evt_open_ && now - evt_last_hit_ >= kMergeGapSec) {
+        SnoreEventSpan ev{};
+        portENTER_CRITICAL(&snore_evt_lock_);
+        const bool recorded = CloseSnoreEventLocked(&ev);
+        portEXIT_CRITICAL(&snore_evt_lock_);
+        if (recorded) {
+            ESP_LOGI(TAG, "鼾声事件: %us ~ %us（间隔 >=%ds 结束）",
+                     (unsigned)ev.s, (unsigned)ev.e, kMergeGapSec);
+        }
+    }
 }
 
 void EdgeAggregator::OnStageResult(int stage_code) {
@@ -114,25 +160,76 @@ void EdgeAggregator::PublishCurrentFrame() {
     if (c.stage_mode == EdgeMode::kOff) f.flags |= 0x02;
     if (c.bcg_mode   == EdgeMode::kOff) f.flags |= 0x04;
 
+    // ★ 收集随本帧上行的鼾声事件（事件挂在「结束所在窗口」的帧上）：
+    //   snore 通道被关 → 打开中的事件就地收尾；然后把 pending 整体取走清空。
+    SnoreEventSpan evs[kMaxPendingEvents];
+    size_t nev = 0;
+    portENTER_CRITICAL(&snore_evt_lock_);
+    if (c.snore_mode == EdgeMode::kOff) CloseSnoreEventLocked();
+    nev = evt_pending_cnt_;
+    memcpy(evs, evt_pending_, nev * sizeof(SnoreEventSpan));
+    evt_pending_cnt_ = 0;
+    portEXIT_CRITICAL(&snore_evt_lock_);
+
+    // snore_events 追加段：无事件时保持空串（JSON 紧凑，不含该字段）；
+    // 有事件时形如 ,"snore_events":[{"s":..,"e":..},{..}]
+    char evbuf[320] = "";
+    size_t evlen = 0;
+    if (nev > 0) {
+        const int h = snprintf(evbuf, sizeof(evbuf), ",\"snore_events\":[");
+        evlen = (h > 0) ? (size_t)h : 0;
+        for (size_t i = 0; i < nev && evlen > 0; ++i) {
+            char one[48];
+            const int w1 = snprintf(one, sizeof(one), "%s{\"s\":%u,\"e\":%u}",
+                                    (i == 0) ? "" : ",",
+                                    (unsigned)evs[i].s, (unsigned)evs[i].e);
+            if (w1 <= 0) break;
+            if (evlen + (size_t)w1 + 2 > sizeof(evbuf)) {   // +2: 留 ']' 与 '\0'
+                ESP_LOGW(TAG, "snore_events 超出缓冲，丢弃多余事件");
+                break;
+            }
+            memcpy(evbuf + evlen, one, (size_t)w1);
+            evlen += (size_t)w1;
+        }
+        if (evlen > 0) {
+            evbuf[evlen++] = ']';
+            evbuf[evlen]   = '\0';
+        } else {
+            evbuf[0] = '\0';
+        }
+    }
+
     // device_id 显式带上：不依赖 IoTDA 规则引擎转发的报文信封结构，
     // 后端 /ingest/huawei/frame 直接读顶层 device_id 即可定位设备。
     const std::string& dev_id = CloudClient::GetInstance().report_device_id();
-    int n = snprintf(f.json, sizeof(f.json),
+    const int n = snprintf(f.json, sizeof(f.json),
         "{\"device_id\":\"%s\",\"evt\":\"frame\","
         "\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"stage\":%d,\"hr\":%d,\"rr\":%d,"
         "\"motion\":%d,\"snore_sec\":%d,\"flags\":%u,"
-        "\"cfg\":{\"snore\":%d,\"stage\":%d,\"bcg\":%d}}",
+        "\"cfg\":{\"snore\":%d,\"stage\":%d,\"bcg\":%d}%s",
         dev_id.c_str(),
         f.window_start_ts, f.window_end_ts,
         (int)f.stage, (int)f.heart_rate, (int)f.resp_rate,
         (int)f.motion, (int)f.snore_seconds, (unsigned)f.flags,
-        (int)c.snore_mode, (int)c.stage_mode, (int)c.bcg_mode);
+        (int)c.snore_mode, (int)c.stage_mode, (int)c.bcg_mode,
+        evbuf);
     f.json_len = (n > 0 && n < (int)sizeof(f.json)) ? n : 0;
 
     latest_ = f;
 
+    // 组装失败（缓冲不够被截断）→ JSON 不完整，宁可丢这一帧也不发坏数据
+    if (f.json_len == 0) {
+        ESP_LOGE(TAG, "30s 帧 JSON 组装失败（截断），本帧跳过");
+        return;
+    }
+
     // 上行 MQTT：/device/{id}/frame
-    CloudClient::GetInstance().PublishFrame(f.json);
+    // 失败（未连接/发送出错）→ 落 SPIFFS 离线队列，MQTT 重连后按序补传。
+    // 注意：NTP 未同步的帧在上方已提前 return，不会进入离线队列
+    //（boot 秒占位的帧补传上去也只会污染时间轴）。
+    if (!CloudClient::GetInstance().PublishFrame(f.json)) {
+        OfflineQueue::GetInstance().Push(f.json, f.json_len);
+    }
     ESP_LOGI(TAG, "30s 帧: stage=%d hr=%d rr=%d motion=%d snore_sec=%d flags=0x%02x",
              (int)f.stage, (int)f.heart_rate, (int)f.resp_rate,
              (int)f.motion, (int)f.snore_seconds, (unsigned)f.flags);
@@ -189,6 +286,11 @@ esp_err_t EdgeAggregator::Start() {
 void EdgeAggregator::Stop() {
     running_ = false;
     grace_until_ts_ = 0;
+    // 清理鼾声事件状态：未结束的事件直接丢弃（不算完整事实）
+    portENTER_CRITICAL(&snore_evt_lock_);
+    evt_open_ = 0;
+    evt_pending_cnt_ = 0;
+    portEXIT_CRITICAL(&snore_evt_lock_);
     if (task_) { vTaskDelete(task_); task_ = nullptr; }
 }
 

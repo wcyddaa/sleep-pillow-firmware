@@ -9,7 +9,9 @@
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mbedtls/md.h"
+#include "offline_queue.h"
 
 static constexpr const char* TAG = "CloudClient";
 
@@ -57,6 +59,33 @@ void LogMqttError(esp_mqtt_event_handle_t event) {
     ESP_LOGE(TAG, "  error_type=%d connect_return_code=%d sock_errno=%d",
              static_cast<int>(e->error_type), static_cast<int>(e->connect_return_code),
              static_cast<int>(e->esp_transport_sock_errno));
+}
+
+// 断网积压帧补传任务：MQTT 每次连上后由事件回调拉起，
+// 按序把 SPIFFS 离线队列里的帧补传出去；发完或再次断开即退出。
+// 帧自带 start/end 时间戳，后端按 (device_id, start) 幂等去重，
+// 与实时帧交错到达也不会污染数据。
+void DrainQueueTask(void* arg) {
+    auto* self = static_cast<CloudClient*>(arg);
+    auto& q    = OfflineQueue::GetInstance();
+    char  buf[512];
+    ESP_LOGI(TAG, "开始补传离线帧，积压 %u 帧", (unsigned)q.Count());
+    while (self->IsConnected() && q.Count() > 0) {
+        size_t len = 0;
+        if (!q.PeekOldest(buf, sizeof(buf), &len)) {
+            // 损坏帧已被自动剔除，稍后轮到下一帧
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (!self->PublishFrame(buf)) {
+            ESP_LOGW(TAG, "补传发送失败，等下次重连再继续");
+            break;
+        }
+        q.PopOldest();
+        vTaskDelay(pdMS_TO_TICKS(100));   // 逐帧补传，避免瞬时洪峰
+    }
+    ESP_LOGI(TAG, "离线帧补传结束，剩余 %u 帧", (unsigned)q.Count());
+    vTaskDelete(nullptr);
 }
 
 }  // namespace
@@ -145,6 +174,9 @@ bool CloudClient::Start(const CloudConfig& config) {
     }
     config_ = config;
 
+    // 断网缓存：挂载 SPIFFS 离线队列（失败仅告警，不影响正常上行/实时帧）
+    OfflineQueue::GetInstance().Init();
+
     // sign_type=1 时平台会校验时间戳，尽力同步一次 NTP
     SyncTime(kNtpTimeoutMs);
 
@@ -205,6 +237,11 @@ void CloudClient::OnEvent(esp_mqtt_event_handle_t event) {
         case MQTT_EVENT_CONNECTED:
             connected_.store(true);
             ESP_LOGI(TAG, "已连接云端 IoTDA");
+            // 断网期间积压的帧：重连成功后按序补传（队列空时任务秒退）
+            if (xTaskCreate(DrainQueueTask, "cloud_drain", 4096, this, 2, nullptr)
+                    != pdPASS) {
+                ESP_LOGW(TAG, "离线帧补传任务创建失败");
+            }
             // 不做上线报到：上下线由 IoTDA「设备状态变更」规则处理 ——
             // 设备一连上，平台自己会推 ONLINE 事件 → 后端自动注册 + 置在线。
             break;
@@ -243,6 +280,25 @@ bool CloudClient::PublishFrame(const char* json) {
     const int msg_id = esp_mqtt_client_publish(client_, topic_up_.c_str(), json, 0, 1, 0);
     if (msg_id < 0) {
         ESP_LOGE(TAG, "PublishFrame publish 失败");
+        return false;
+    }
+    return true;
+}
+
+// ============================================================
+// PublishCfg：cfg 快照上行（与 PublishFrame 同主题，后端按 evt 分流）
+// 刻意不进离线队列：断网期间积压的过期 cfg 补传上去，
+// 反而可能把设备已改的新状态覆盖掉 —— 所以未连接就直接放弃。
+// ============================================================
+bool CloudClient::PublishCfg(const char* json) {
+    if (client_ == nullptr || !connected_.load()) {
+        ESP_LOGW(TAG, "PublishCfg：MQTT 未就绪，放弃本次快照（帧内 cfg 兜底）");
+        return false;
+    }
+    if (json == nullptr) return false;
+    const int msg_id = esp_mqtt_client_publish(client_, topic_up_.c_str(), json, 0, 1, 0);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "PublishCfg publish 失败");
         return false;
     }
     return true;

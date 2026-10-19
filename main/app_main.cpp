@@ -482,8 +482,9 @@ static void ApplyEdgeCfg() {
         agg->Start();   // 首次启动会走 5 秒宽限期再开始 30s 封装
     }
 
-    // 注：三开关不再上行到云端（设备本地状态，手机经 BLE 读写）。
-    //     当前 cfg 会作为字段随每一帧上行，后端无需单独存。
+    // 注：三开关权威状态仍是设备本地 NVS（BLE 0x04/0x05 读写）。
+    //     上云的只有两类：每帧 payload 里的 cfg 字段（兜底刷新）+
+    //     BLE 切开关时的 evt:"cfg" 快照（见 OnCfgChanged），后端落 device_cfg 表。
     ESP_LOGW(TAG, "ApplyEdgeCfg: snore=%d stage=%d bcg=%d",
              (int)c.snore_mode, (int)c.stage_mode, (int)c.bcg_mode);
 }
@@ -493,6 +494,23 @@ static void OnCfgChanged(int snore, int stage, int bcg) {
     (void)snore; (void)stage; (void)bcg;
     ESP_LOGW(TAG, "=== EDGE_CFG_CHANGED ===");
     ApplyEdgeCfg();
+
+    // ★ cfg 快照上行：给云端补一份「当前是否在监测」的可查镜像
+    //   （换手机/多设备管理场景不依赖 BLE）。本地 NVS 权威性不变。
+    //   未连接就放弃 —— 快照不进离线队列，过期 cfg 不应覆盖新状态。
+    if (g_cfg) {
+        const auto& c = g_cfg->Get();
+        char json[192];
+        snprintf(json, sizeof(json),
+                 "{\"device_id\":\"%s\",\"evt\":\"cfg\","
+                 "\"cfg\":{\"snore\":%d,\"stage\":%d,\"bcg\":%d},\"ts\":%lld}",
+                 CloudClient::GetInstance().report_device_id().c_str(),
+                 (int)c.snore_mode, (int)c.stage_mode, (int)c.bcg_mode,
+                 (long long)time(nullptr));
+        if (!CloudClient::GetInstance().PublishCfg(json)) {
+            ESP_LOGW(TAG, "cfg 快照未上行（未连接），等帧内 cfg 字段兜底");
+        }
+    }
 }
 
 // ============================================================
