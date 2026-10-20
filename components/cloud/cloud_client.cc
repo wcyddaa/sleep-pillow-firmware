@@ -67,7 +67,7 @@ void LogMqttError(esp_mqtt_event_handle_t event) {
 // 与实时帧交错到达也不会污染数据。
 void DrainQueueTask(void* arg) {
     auto* self = static_cast<CloudClient*>(arg);
-    auto& q    = OfflineQueue::GetInstance();
+    auto& q    = sleep_pillow::OfflineQueue::GetInstance();
     char  buf[512];
     ESP_LOGI(TAG, "开始补传离线帧，积压 %u 帧", (unsigned)q.Count());
     while (self->IsConnected() && q.Count() > 0) {
@@ -175,7 +175,7 @@ bool CloudClient::Start(const CloudConfig& config) {
     config_ = config;
 
     // 断网缓存：挂载 SPIFFS 离线队列（失败仅告警，不影响正常上行/实时帧）
-    OfflineQueue::GetInstance().Init();
+    sleep_pillow::OfflineQueue::GetInstance().Init();
 
     // sign_type=1 时平台会校验时间戳，尽力同步一次 NTP
     SyncTime(kNtpTimeoutMs);

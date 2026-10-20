@@ -165,7 +165,10 @@ void EdgeAggregator::PublishCurrentFrame() {
     SnoreEventSpan evs[kMaxPendingEvents];
     size_t nev = 0;
     portENTER_CRITICAL(&snore_evt_lock_);
-    if (c.snore_mode == EdgeMode::kOff) CloseSnoreEventLocked();
+    if (c.snore_mode == EdgeMode::kOff) {
+        SnoreEventSpan discarded;   // 收尾事件进 pending 即可，span 本身不需要
+        CloseSnoreEventLocked(&discarded);
+    }
     nev = evt_pending_cnt_;
     memcpy(evs, evt_pending_, nev * sizeof(SnoreEventSpan));
     evt_pending_cnt_ = 0;
@@ -206,7 +209,7 @@ void EdgeAggregator::PublishCurrentFrame() {
         "{\"device_id\":\"%s\",\"evt\":\"frame\","
         "\"start\":%" PRIu32 ",\"end\":%" PRIu32 ",\"stage\":%d,\"hr\":%d,\"rr\":%d,"
         "\"motion\":%d,\"snore_sec\":%d,\"flags\":%u,"
-        "\"cfg\":{\"snore\":%d,\"stage\":%d,\"bcg\":%d}%s",
+        "\"cfg\":{\"snore\":%d,\"stage\":%d,\"bcg\":%d}%s}",
         dev_id.c_str(),
         f.window_start_ts, f.window_end_ts,
         (int)f.stage, (int)f.heart_rate, (int)f.resp_rate,
